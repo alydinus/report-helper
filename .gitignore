@@ -1,0 +1,6 @@
+.gemini-key
+.venv
+.idea
+.env
+service-account.json
+*.iml
