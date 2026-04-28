@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+# report-helper — CLI for git-commit → Gemini → Google Sheets reporter.
+set -eo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+INSTALL_DIR="$(dirname "$(dirname "$SCRIPT_PATH")")"
+GLOBAL_CONFIG_DIR="${REPORT_HELPER_CONFIG:-$HOME/.config/report-helper}"
+
+usage() {
+    cat <<EOF
+report-helper — git commit reporter (Gemini → Google Sheets)
+
+Usage:
+  report-helper bootstrap        Create global config and seed templates
+  report-helper link [DEST]      Symlink CLI into PATH (default ~/.local/bin)
+  report-helper build            (Re)build the docker image
+  report-helper init             Create per-repo overrides at <repo>/.report-helper/
+  report-helper install [--sync] Install post-commit hook in current repo (async by default)
+  report-helper uninstall        Remove the post-commit hook
+  report-helper run [COMMIT]     Run report for COMMIT (default HEAD)
+  report-helper status           Show config / image / hook state
+  report-helper help             This help
+
+Configuration cascade (later overrides earlier):
+  1. ~/.config/report-helper/.env        (global)
+  2. <repo>/.report-helper/.env          (per-repo, optional)
+
+Inside the docker container the global config is mounted read-only at
+/config, and the per-repo override (if present) at /config-repo.
+EOF
+}
+
+die()  { echo "report-helper: $*" >&2; exit 1; }
+info() { echo "report-helper: $*"; }
+
+require_docker() {
+    command -v docker >/dev/null 2>&1 || die "docker not found in PATH"
+}
+
+require_env() {
+    local missing=() var
+    for var in "$@"; do
+        [ -n "${!var:-}" ] || missing+=("$var")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        die "required env vars not set: ${missing[*]} (check $GLOBAL_CONFIG_DIR/.env)"
+    fi
+}
+
+repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null || die "not in a git repository"
+}
+
+parent_repo() {
+    git rev-parse --show-toplevel >/dev/null 2>&1 || die "not in a git repository"
+    local sup
+    sup=$(git rev-parse --show-superproject-working-tree 2>/dev/null || true)
+    if [ -n "$sup" ]; then
+        echo "$sup"
+    else
+        git rev-parse --show-toplevel
+    fi
+}
+
+source_env() {
+    [ -f "$1" ] || return 0
+    set -a; . "$1"; set +a
+}
+
+cmd_bootstrap() {
+    mkdir -p "$GLOBAL_CONFIG_DIR"
+    if [ ! -f "$GLOBAL_CONFIG_DIR/.env" ]; then
+        cp "$INSTALL_DIR/.env.example" "$GLOBAL_CONFIG_DIR/.env"
+        info "created $GLOBAL_CONFIG_DIR/.env"
+    fi
+    if [ ! -f "$GLOBAL_CONFIG_DIR/prompt.txt" ]; then
+        cp "$INSTALL_DIR/prompt.txt" "$GLOBAL_CONFIG_DIR/prompt.txt"
+        info "created $GLOBAL_CONFIG_DIR/prompt.txt"
+    fi
+    cat <<EOF
+
+next steps:
+  1. edit  $GLOBAL_CONFIG_DIR/.env       (SPREADSHEET_ID, GEMINI_API_KEY, ...)
+  2. place service-account.json in       $GLOBAL_CONFIG_DIR/
+  3. report-helper link                  (symlink CLI into PATH)
+  4. report-helper build                 (build docker image)
+  5. cd <your-repo> && report-helper install
+EOF
+}
+
+cmd_link() {
+    local dest="${1:-$HOME/.local/bin}"
+    mkdir -p "$dest"
+    ln -sf "$INSTALL_DIR/bin/report-helper" "$dest/report-helper"
+    info "linked $dest/report-helper -> $INSTALL_DIR/bin/report-helper"
+    case ":$PATH:" in
+        *":$dest:"*) ;;
+        *) echo "warning: $dest is not in PATH" >&2 ;;
+    esac
+}
+
+cmd_build() {
+    require_docker
+    source_env "$GLOBAL_CONFIG_DIR/.env"
+    local image="${REPORT_IMAGE_NAME:-report}"
+    docker build -t "$image" "$INSTALL_DIR"
+    info "built image: $image"
+}
+
+cmd_init() {
+    local repo dir
+    repo=$(parent_repo)
+    dir="$repo/.report-helper"
+    mkdir -p "$dir"
+    if [ ! -f "$dir/.env" ]; then
+        cat > "$dir/.env" <<'EOF'
+# Per-repo overrides for report-helper.
+# Anything not set here falls back to ~/.config/report-helper/.env.
+#
+# Examples:
+# SPREADSHEET_ID=
+# SHEET_NAME=
+# EXPECTED_COLUMNS=
+# # Use a per-repo prompt (file lives in <repo>/.report-helper/prompt.txt):
+# PROMPT_FILE=/config-repo/prompt.txt
+# # Use a per-repo service account (file lives in <repo>/.report-helper/):
+# SERVICE_ACCOUNT_FILE=/config-repo/service-account.json
+EOF
+        info "created $dir/.env"
+    fi
+
+    local gitignore="$repo/.gitignore"
+    if ! grep -qxF ".report-helper/" "$gitignore" 2>/dev/null; then
+        echo ".report-helper/" >> "$gitignore"
+        info "added .report-helper/ to $gitignore"
+    fi
+
+    info "per-repo config: $dir"
+    info "to override the prompt for this repo: drop a prompt.txt into $dir and set PROMPT_FILE=/config-repo/prompt.txt"
+}
+
+cmd_install() {
+    [ -d "$GLOBAL_CONFIG_DIR" ] || die "global config not found; run: report-helper bootstrap"
+
+    local sync=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --sync) sync=1 ;;
+            --async) sync=0 ;;
+            *) die "unknown option: $1 (supported: --sync, --async)" ;;
+        esac
+        shift
+    done
+
+    local repo hook
+    repo=$(repo_root)
+    hook="$repo/.git/hooks/post-commit"
+    if [ -e "$hook" ] && ! grep -q "managed by report-helper" "$hook" 2>/dev/null; then
+        die "$hook exists and isn't managed by report-helper. Move it aside first."
+    fi
+    if [ $sync -eq 1 ]; then
+        cat > "$hook" <<'EOF'
+#!/bin/bash
+# managed by report-helper (sync)
+report-helper run >/dev/null 2>&1 || true
+exit 0
+EOF
+    else
+        cat > "$hook" <<'EOF'
+#!/bin/bash
+# managed by report-helper (async)
+( report-helper run </dev/null >/dev/null 2>&1 & ) </dev/null >/dev/null 2>&1
+exit 0
+EOF
+    fi
+    chmod +x "$hook"
+    info "installed $hook ($([ $sync -eq 1 ] && echo sync || echo async))"
+}
+
+cmd_uninstall() {
+    local repo hook
+    repo=$(repo_root)
+    hook="$repo/.git/hooks/post-commit"
+    if [ -f "$hook" ] && grep -q "managed by report-helper" "$hook"; then
+        rm -f "$hook"
+        info "removed $hook"
+    else
+        info "no report-helper hook found in $hook"
+    fi
+}
+
+cmd_run() {
+    require_docker
+    local commit="${1:-HEAD}"
+    local repo
+    repo=$(parent_repo)
+
+    [ -d "$GLOBAL_CONFIG_DIR" ] || die "no global config; run: report-helper bootstrap"
+    source_env "$GLOBAL_CONFIG_DIR/.env"
+    source_env "$repo/.report-helper/.env"
+    require_env SPREADSHEET_ID GEMINI_API_KEY
+
+    local image="${REPORT_IMAGE_NAME:-report}"
+    local date_format="${DATE_FORMAT:-+%d-%m-%Y}"
+    local log_file="${REPORT_LOG_FILE:-$repo/hook.log}"
+    local git_date_fmt="${date_format#+}"
+
+    local commit_date hash msg
+    commit_date=$(git log -1 --format=%cd --date=format:"$git_date_fmt" "$commit")
+    hash=$(git rev-parse --short "$commit")
+    msg=$(git log -1 --pretty=%B "$commit")
+
+    local origin origin_rel
+    origin=$(git rev-parse --show-toplevel)
+    origin_rel="${origin#$repo/}"
+    [ "$origin_rel" = "$origin" ] && origin_rel="<root>"
+
+    {
+        echo ""
+        echo "=================================================="
+        echo "=== post-commit @ $(date '+%Y-%m-%d %H:%M:%S') (from: $origin_rel) ==="
+        echo "=================================================="
+    } >> "$log_file"
+
+    log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$log_file"; }
+
+    log "INPUT date=$commit_date hash=$hash msg=$msg"
+
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        log "IMAGE '$image' not found, building from $INSTALL_DIR ..."
+        if ! docker build -t "$image" "$INSTALL_DIR" >> "$log_file" 2>&1; then
+            log "BUILD FAILED"
+            echo "report-helper: docker build failed, see $log_file" >&2
+            exit 1
+        fi
+        log "BUILD OK"
+    fi
+
+    local mounts=(-v "$GLOBAL_CONFIG_DIR:/config:ro")
+    if [ -d "$repo/.report-helper" ]; then
+        mounts+=(-v "$repo/.report-helper:/config-repo:ro")
+    fi
+
+    local env_args=()
+    [ -f "$GLOBAL_CONFIG_DIR/.env" ]      && env_args+=(--env-file "$GLOBAL_CONFIG_DIR/.env")
+    [ -f "$repo/.report-helper/.env" ]    && env_args+=(--env-file "$repo/.report-helper/.env")
+
+    log "RUN docker run image=$image"
+    local out status=0
+    out=$(docker run --rm "${mounts[@]}" "${env_args[@]}" \
+        "$image" "$commit_date" "$hash" "$msg" 2>&1) || status=$?
+
+    if [ -n "$out" ]; then
+        echo "--- container output ---" >> "$log_file"
+        echo "$out"                       >> "$log_file"
+        echo "--- end container output ---" >> "$log_file"
+    fi
+
+    if [ "$status" -eq 0 ]; then
+        log "RESULT OK"
+    else
+        log "RESULT FAIL (exit=$status)"
+        echo "report-helper: report failed (exit=$status), see $log_file" >&2
+        exit "$status"
+    fi
+}
+
+cmd_status() {
+    echo "install dir:    $INSTALL_DIR"
+    if [ -d "$GLOBAL_CONFIG_DIR" ]; then
+        echo "global config:  $GLOBAL_CONFIG_DIR"
+        for f in .env prompt.txt service-account.json; do
+            if [ -f "$GLOBAL_CONFIG_DIR/$f" ]; then
+                printf "  %-22s ok\n" "$f:"
+            else
+                printf "  %-22s MISSING\n" "$f:"
+            fi
+        done
+    else
+        echo "global config:  $GLOBAL_CONFIG_DIR (not bootstrapped — run: report-helper bootstrap)"
+    fi
+
+    source_env "$GLOBAL_CONFIG_DIR/.env" 2>/dev/null || true
+
+    local repo=""
+    if git rev-parse --show-toplevel >/dev/null 2>&1; then
+        repo=$(parent_repo)
+        source_env "$repo/.report-helper/.env" 2>/dev/null || true
+    fi
+
+    local image="${REPORT_IMAGE_NAME:-report}"
+    if command -v docker >/dev/null 2>&1; then
+        if docker image inspect "$image" >/dev/null 2>&1; then
+            echo "docker image:   $image (built)"
+        else
+            echo "docker image:   $image (NOT BUILT — run: report-helper build)"
+        fi
+    else
+        echo "docker image:   docker not in PATH"
+    fi
+
+    echo "resolved env:"
+    printf "  %-22s %s\n" "SPREADSHEET_ID:"   "${SPREADSHEET_ID:-<unset>}"
+    printf "  %-22s %s\n" "SHEET_NAME:"       "${SHEET_NAME:-<first sheet>}"
+    printf "  %-22s %s\n" "EXPECTED_COLUMNS:" "${EXPECTED_COLUMNS:-0}"
+    printf "  %-22s %s\n" "PROMPT_FILE:"      "${PROMPT_FILE:-prompt.txt}"
+    printf "  %-22s %s\n" "SERVICE_ACCOUNT_FILE:" "${SERVICE_ACCOUNT_FILE:-service-account.json}"
+    if [ -n "${GEMINI_API_KEY:-}" ]; then
+        printf "  %-22s <set, %d chars>\n" "GEMINI_API_KEY:" "${#GEMINI_API_KEY}"
+    else
+        printf "  %-22s <unset>\n" "GEMINI_API_KEY:"
+    fi
+
+    if [ -n "$repo" ]; then
+        echo "repo:           $repo"
+        if [ -d "$repo/.report-helper" ]; then
+            echo "per-repo cfg:   $repo/.report-helper (present)"
+        else
+            echo "per-repo cfg:   none"
+        fi
+        local hook
+        hook="$(repo_root)/.git/hooks/post-commit"
+        if [ -f "$hook" ] && grep -q "managed by report-helper" "$hook"; then
+            local mode
+            mode=$(grep -oE 'managed by report-helper \([a-z]+\)' "$hook" | grep -oE '\([a-z]+\)' || echo "")
+            echo "hook:           installed at $hook ${mode}"
+        elif [ -f "$hook" ]; then
+            echo "hook:           $hook exists but not managed by report-helper"
+        else
+            echo "hook:           not installed"
+        fi
+    else
+        echo "repo:           (not in a git repo)"
+    fi
+}
+
+case "${1:-help}" in
+    bootstrap)      shift; cmd_bootstrap "$@" ;;
+    link)           shift; cmd_link "$@" ;;
+    build)          shift; cmd_build "$@" ;;
+    init)           shift; cmd_init "$@" ;;
+    install)        shift; cmd_install "$@" ;;
+    uninstall)      shift; cmd_uninstall "$@" ;;
+    run)            shift; cmd_run "$@" ;;
+    status)         shift; cmd_status "$@" ;;
+    help|-h|--help) usage ;;
+    *)              usage; exit 1 ;;
+esac
