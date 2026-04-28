@@ -9,7 +9,6 @@ fi
 
 LOG_FILE="$PARENT_REPO/hook.log"
 SCRIPTS_DIR="$PARENT_REPO/scripts"
-IMAGE_NAME="report"
 
 ORIGIN=$(git rev-parse --show-toplevel)
 ORIGIN_REL="${ORIGIN#$PARENT_REPO/}"
@@ -26,7 +25,16 @@ log() {
     echo "=================================================="
 } >> "$LOG_FILE"
 
-DATE=$(date +"%d-%m-%Y")
+if [ -f "$SCRIPTS_DIR/.env" ]; then
+    set -a
+    . "$SCRIPTS_DIR/.env"
+    set +a
+fi
+
+IMAGE_NAME="${REPORT_IMAGE_NAME:-report}"
+DATE_FORMAT="${DATE_FORMAT:-+%d-%m-%Y}"
+
+DATE=$(date "$DATE_FORMAT")
 HASH=$(git rev-parse --short HEAD)
 MSG=$(git log -1 --pretty=%B)
 
@@ -51,10 +59,14 @@ if [ -z "$GEMINI_API_KEY" ] && [ -f "$SCRIPTS_DIR/.gemini-key" ]; then
     GEMINI_API_KEY=$(tr -d '\n\r' < "$SCRIPTS_DIR/.gemini-key")
 fi
 
-log "RUN docker run --rm -e GEMINI_API_KEY=*** $IMAGE_NAME \"$DATE\" \"$HASH\" \"$MSG\""
+ENV_FILE_ARG=()
+[ -f "$SCRIPTS_DIR/.env" ] && ENV_FILE_ARG=(--env-file "$SCRIPTS_DIR/.env")
+
+log "RUN docker run --rm -v $SCRIPTS_DIR:/config:ro $IMAGE_NAME \"$DATE\" \"$HASH\" \"$MSG\""
 RUN_OUT=$(docker run --rm \
+    -v "$SCRIPTS_DIR:/config:ro" \
+    "${ENV_FILE_ARG[@]}" \
     -e GEMINI_API_KEY="$GEMINI_API_KEY" \
-    -e GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash}" \
     "$IMAGE_NAME" "$DATE" "$HASH" "$MSG" 2>&1)
 RUN_STATUS=$?
 

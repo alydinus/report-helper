@@ -9,6 +9,8 @@ RUN pip install --no-cache-dir \
     google-api-python-client \
     google-genai
 
-COPY service-account.json report.py ./
+COPY report.py ./
 
-ENTRYPOINT ["python", "report.py"]
+WORKDIR /config
+
+ENTRYPOINT ["python", "/app/report.py"]

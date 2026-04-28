@@ -9,47 +9,53 @@ from google.genai import errors as genai_errors
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-SPREADSHEET_ID = "1e9PTXF1ph3oupVzE9NqGey-qxUzM72fnZe2Vi2J4GmQ"
-SERVICE_ACCOUNT_FILE = "service-account.json"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
+
+def env(name: str, default: str | None = None, *, required: bool = False) -> str:
+    val = os.environ.get(name, default)
+    if required and not val:
+        raise RuntimeError(f"{name} is not set")
+    return val or ""
+
+
+SPREADSHEET_ID = env("SPREADSHEET_ID", required=True)
+SHEET_NAME = env("SHEET_NAME")
+SERVICE_ACCOUNT_FILE = env("SERVICE_ACCOUNT_FILE", "service-account.json")
+PROMPT_FILE = env("PROMPT_FILE", "prompt.txt")
+EXPECTED_COLUMNS = int(env("EXPECTED_COLUMNS", "0") or 0)
+START_COLUMN = env("START_COLUMN", "A")
+
+GEMINI_API_KEY = env("GEMINI_API_KEY", required=True)
 GEMINI_MODELS = [
     m.strip()
-    for m in os.environ.get(
+    for m in env(
         "GEMINI_MODELS",
         "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash",
     ).split(",")
     if m.strip()
 ]
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "3"))
-RETRYABLE_CODES = {429, 500, 502, 503, 504}
-
-date = sys.argv[1]
-commit_hash = sys.argv[2]
-message = sys.argv[3]
+GEMINI_MAX_RETRIES = int(env("GEMINI_MAX_RETRIES", "3"))
 
 
-def format_with_gemini(date: str, commit_hash: str, message: str) -> list[str]:
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is not set")
+def column_letter(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
-    prompt = (
-        "Ты помощник по учёту рабочего времени. На вход даётся git-коммит. "
-        "Сформируй ОДНУ строку CSV (разделитель — запятая, поля с запятыми/переводами строк бери в двойные кавычки) "
-        "ровно с пятью колонками в таком порядке: Дата,Задача,Описание,Сложность,Часы.\n"
-        "Правила:\n"
-        "- Дата: используй переданное значение как есть.\n"
-        "- Задача: короткий заголовок (тип + область), 3–6 слов, по сути коммита.\n"
-        "- Описание: 1–2 предложения по-русски, что именно сделано.\n"
-        "- Сложность: одно из Низкая/Средняя/Высокая.\n"
-        "- Часы: целое число от 1 до 8, реалистичная оценка.\n"
-        "Не добавляй заголовок, не добавляй markdown, не оборачивай в ```. Верни ровно одну строку CSV.\n\n"
-        f"Дата: {date}\n"
-        f"Хеш: {commit_hash}\n"
-        f"Сообщение коммита:\n{message}\n"
-    )
 
+def load_prompt(path: str, **vars: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        tmpl = f.read()
+    for k, v in vars.items():
+        tmpl = tmpl.replace("{{" + k + "}}", v)
+    return tmpl
+
+
+def format_with_gemini(prompt: str) -> list[str]:
     client = genai.Client(api_key=GEMINI_API_KEY)
 
     last_err: Exception | None = None
@@ -94,16 +100,32 @@ def format_with_gemini(date: str, commit_hash: str, message: str) -> list[str]:
     if not line:
         raise ValueError("Gemini returned empty response")
     row = next(csv.reader(io.StringIO(line)))
-    if len(row) != 5:
-        raise ValueError(f"Gemini returned {len(row)} columns, expected 5: {row!r}")
+    if EXPECTED_COLUMNS and len(row) != EXPECTED_COLUMNS:
+        raise ValueError(
+            f"Gemini returned {len(row)} columns, expected {EXPECTED_COLUMNS}: {row!r}"
+        )
     return [c.strip() for c in row]
 
 
+def pad_or_trim(values: list[str], size: int) -> list[str]:
+    if len(values) >= size:
+        return values[:size]
+    return values + [""] * (size - len(values))
+
+
+date = sys.argv[1]
+commit_hash = sys.argv[2]
+message = sys.argv[3]
+
+prompt = load_prompt(PROMPT_FILE, date=date, commit_hash=commit_hash, message=message)
+
 try:
-    row = format_with_gemini(date, commit_hash, message)
+    row = format_with_gemini(prompt)
 except Exception as e:
     print(f"gemini formatting failed, falling back to raw values: {e}", file=sys.stderr)
-    row = [date, commit_hash, message, "", ""]
+    row = [date, commit_hash, message]
+    if EXPECTED_COLUMNS:
+        row = pad_or_trim(row, EXPECTED_COLUMNS)
 
 print(f"row to append: {row!r}", file=sys.stderr)
 
@@ -113,15 +135,20 @@ creds = service_account.Credentials.from_service_account_file(
 )
 service = build("sheets", "v4", credentials=creds)
 
-meta = service.spreadsheets().get(
-    spreadsheetId=SPREADSHEET_ID,
-    fields="sheets.properties.title",
-).execute()
-sheet_name = meta["sheets"][0]["properties"]["title"]
+sheet_name = SHEET_NAME
+if not sheet_name:
+    meta = service.spreadsheets().get(
+        spreadsheetId=SPREADSHEET_ID,
+        fields="sheets.properties.title",
+    ).execute()
+    sheet_name = meta["sheets"][0]["properties"]["title"]
+
+end_column = column_letter(EXPECTED_COLUMNS or len(row))
+sheet_range = f"{sheet_name}!{START_COLUMN}:{end_column}"
 
 service.spreadsheets().values().append(
     spreadsheetId=SPREADSHEET_ID,
-    range=f"{sheet_name}!A:E",
+    range=sheet_range,
     valueInputOption="USER_ENTERED",
     insertDataOption="INSERT_ROWS",
     body={"values": [row]},
